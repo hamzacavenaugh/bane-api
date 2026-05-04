@@ -1,79 +1,62 @@
 /* =========================================================
-   BANE PERFORMANCE PEPTIDES — local server
-   Express + JSON-file storage. No native deps.
-   - Serves static site from project root
-   - Public APIs:    /api/orders, /api/track, /api/reviews, /api/coupons/validate
-   - Admin auth:     /api/admin/login|logout|me
-   - Admin APIs:     /api/admin/orders, /coupons, /reviews, /products, /analytics
-   - Admin pages:    /admin → login.html or dashboard.html (auth-gated server-side)
+   BANE PERFORMANCE PEPTIDES — backend
+   Express + Supabase Postgres. Runs on Render, called cross-origin
+   from the SiteGround static site.
+
+   Auth: token-based (Authorization: Bearer <token>) for cross-origin
+   support; session cookie kept as fallback for same-origin localhost.
+
+   Storage: Supabase Postgres via @supabase/supabase-js using the
+   service role key. RLS is enabled on every table; service role
+   bypasses by design.
    ========================================================= */
 
 const express = require('express');
 const session = require('express-session');
 const bcrypt  = require('bcryptjs');
-const fs      = require('fs');
-const path    = require('path');
 const crypto  = require('crypto');
+const { createClient } = require('@supabase/supabase-js');
 
 const PORT     = process.env.PORT || 3000;
-const ROOT     = __dirname;
-const DATA_DIR = path.join(ROOT, 'data');
-const DB_FILE  = path.join(DATA_DIR, 'bane.json');
+const IS_PROD  = process.env.NODE_ENV === 'production';
 
-// ---------- Default admin (override via env on production) ----------
-const DEFAULT_ADMIN_EMAIL = process.env.ADMIN_EMAIL || 'support@baneperformance.com';
+// ---------- Supabase ----------
+const SUPABASE_URL = process.env.SUPABASE_URL;
+const SUPABASE_KEY = process.env.SUPABASE_KEY;
+if (!SUPABASE_URL || !SUPABASE_KEY) {
+  console.error('Missing SUPABASE_URL or SUPABASE_KEY. Set env vars and restart.');
+  process.exit(1);
+}
+const sb = createClient(SUPABASE_URL, SUPABASE_KEY, {
+  auth: { persistSession: false, autoRefreshToken: false },
+});
+
+// ---------- Defaults / seed ----------
+const DEFAULT_ADMIN_EMAIL = (process.env.ADMIN_EMAIL || 'support@baneperformance.com').toLowerCase();
 const DEFAULT_ADMIN_PASS  = process.env.ADMIN_PASSWORD || 'BanePerf!2026';
+const TOKEN_TTL_MS = 1000 * 60 * 60 * 8; // 8 hours
 
-// ---------- Tiny JSON-file DB ----------
-if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-
-let db = {
-  orders: [], reviews: [], coupons: [],
-  product_overrides: [], custom_products: [],
-  analytics: [], admin_users: [],
-  admin_sessions: [], // token-based auth (works cross-origin without 3rd-party cookies)
-};
-
-function load() {
-  try {
-    if (fs.existsSync(DB_FILE)) {
-      db = { ...db, ...JSON.parse(fs.readFileSync(DB_FILE, 'utf8')) };
-    }
-  } catch (e) {
-    console.error('DB load failed, starting fresh:', e.message);
-  }
-}
-function save() {
-  fs.writeFileSync(DB_FILE, JSON.stringify(db, null, 2));
-}
 function uid() { return crypto.randomBytes(8).toString('hex'); }
-function now() { return new Date().toISOString(); }
 
-load();
-
-// Seed admin if missing
-if (db.admin_users.length === 0) {
-  db.admin_users.push({
+async function ensureSeedAdmin() {
+  const { data, error } = await sb.from('admin_users').select('id').limit(1);
+  if (error) { console.error('seed check failed:', error.message); return; }
+  if (data && data.length > 0) return;
+  const { error: e2 } = await sb.from('admin_users').insert({
     id: uid(),
-    email: DEFAULT_ADMIN_EMAIL.toLowerCase(),
+    email: DEFAULT_ADMIN_EMAIL,
     password_hash: bcrypt.hashSync(DEFAULT_ADMIN_PASS, 10),
-    created_at: now(),
   });
-  save();
-  console.log(`\n[seed] Created default admin: ${DEFAULT_ADMIN_EMAIL}\n`);
+  if (e2) console.error('seed insert failed:', e2.message);
+  else console.log(`[seed] Created default admin: ${DEFAULT_ADMIN_EMAIL}`);
 }
 
 // ---------- App ----------
 const app = express();
-const IS_PROD = process.env.NODE_ENV === 'production';
-
-// Trust the first proxy in front (Render's load balancer) so secure cookies
-// work and req.ip / proto come from X-Forwarded-* headers.
 if (IS_PROD) app.set('trust proxy', 1);
 
-app.use(express.json({ limit: '12mb' })); // allow base64-encoded image uploads
+app.use(express.json({ limit: '12mb' }));
 
-// CORS — allow the static-site origins to call the API with credentials.
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
   'http://localhost:3000,https://cavenaughm20.sg-host.com'
 ).split(',').map(s => s.trim()).filter(Boolean);
@@ -91,7 +74,6 @@ app.use((req, res, next) => {
   next();
 });
 
-// Dev server: never cache HTML/JS/CSS so iterative changes show on refresh.
 if (!IS_PROD) {
   app.use((req, res, next) => {
     res.setHeader('Cache-Control', 'no-store, no-cache, must-revalidate');
@@ -107,47 +89,43 @@ app.use(session({
   proxy: IS_PROD,
   cookie: {
     httpOnly: true,
-    // Cross-origin (static site on SG, API on Render) needs SameSite=None + Secure.
     sameSite: IS_PROD ? 'none' : 'lax',
     secure:   IS_PROD,
-    maxAge: 1000 * 60 * 60 * 8,
+    maxAge: TOKEN_TTL_MS,
   },
 }));
 
-// ---------- Token auth helpers ----------
-// Cross-origin browsers (Safari, Firefox strict, Brave, incognito) block 3rd-party
-// cookies by default, which breaks session-based auth when the API is on a
-// different origin from the static site. Tokens in Authorization headers don't
-// have that problem.
-const TOKEN_TTL_MS = 1000 * 60 * 60 * 8; // 8 hours
-
-function pruneSessions() {
-  const cutoff = Date.now() - TOKEN_TTL_MS;
-  const before = db.admin_sessions.length;
-  db.admin_sessions = db.admin_sessions.filter(s => new Date(s.created_at).getTime() > cutoff);
-  return db.admin_sessions.length !== before;
-}
-
+// ---------- Auth helpers ----------
 function tokenFromRequest(req) {
   const h = req.headers.authorization || '';
   const m = /^Bearer\s+(.+)$/i.exec(h);
   return m ? m[1].trim() : null;
 }
 
-function requireAdmin(req, res, next) {
-  // 1) Token (preferred — works cross-origin)
+async function userFromToken(token) {
+  if (!token) return null;
+  const cutoff = new Date(Date.now() - TOKEN_TTL_MS).toISOString();
+  const { data: sess } = await sb
+    .from('admin_sessions')
+    .select('user_id, created_at')
+    .eq('token', token)
+    .gte('created_at', cutoff)
+    .maybeSingle();
+  if (!sess) return null;
+  const { data: user } = await sb
+    .from('admin_users')
+    .select('id, email')
+    .eq('id', sess.user_id)
+    .maybeSingle();
+  return user || null;
+}
+
+async function requireAdmin(req, res, next) {
   const token = tokenFromRequest(req);
   if (token) {
-    const sess = db.admin_sessions.find(s => s.token === token);
-    if (sess && (Date.now() - new Date(sess.created_at).getTime()) < TOKEN_TTL_MS) {
-      const user = db.admin_users.find(u => u.id === sess.user_id);
-      if (user) {
-        req.admin = { id: user.id, email: user.email };
-        return next();
-      }
-    }
+    const user = await userFromToken(token);
+    if (user) { req.admin = user; return next(); }
   }
-  // 2) Session cookie (still works on localhost / same-origin)
   if (req.session && req.session.adminId) {
     req.admin = { id: req.session.adminId, email: req.session.adminEmail };
     return next();
@@ -156,7 +134,7 @@ function requireAdmin(req, res, next) {
 }
 
 // ---------- Public APIs ----------
-app.post('/api/orders', (req, res) => {
+app.post('/api/orders', async (req, res) => {
   const { customer = {}, items = [], coupon_code, subtotal, discount, shipping, total } = req.body || {};
   if (!Array.isArray(items) || items.length === 0) return res.status(400).json({ error: 'no items' });
   const order = {
@@ -173,141 +151,145 @@ app.post('/api/orders', (req, res) => {
     shipping: Number(shipping) || 0,
     total: Number(total) || 0,
     status: 'pending',
-    created_at: now(),
   };
-  db.orders.unshift(order);
-  save();
+  const { error } = await sb.from('orders').insert(order);
+  if (error) return res.status(500).json({ error: 'db', details: error.message });
   res.json({ ok: true, id: order.id });
 });
 
-app.post('/api/track', (req, res) => {
+app.post('/api/track', async (req, res) => {
   const { event_type, page, product_id } = req.body || {};
-  db.analytics.unshift({
-    id: uid(),
+  await sb.from('analytics_events').insert({
     event_type: event_type || 'view',
     page: page || '/',
     product_id: product_id || null,
     user_agent: (req.headers['user-agent'] || '').slice(0, 240),
-    created_at: now(),
   });
-  // cap analytics rows
-  if (db.analytics.length > 5000) db.analytics.length = 5000;
-  save();
   res.json({ ok: true });
 });
 
-app.post('/api/reviews', (req, res) => {
+app.post('/api/reviews', async (req, res) => {
   const { name, location, rating, content } = req.body || {};
   if (!name || !content) return res.status(400).json({ error: 'name and review required' });
   const r = parseInt(rating, 10);
-  db.reviews.unshift({
+  const { error } = await sb.from('reviews').insert({
     id: uid(),
     name: String(name).slice(0, 80),
     location: String(location || '').slice(0, 80),
     rating: (r >= 1 && r <= 5) ? r : 5,
     content: String(content).slice(0, 2000),
     status: 'pending',
-    visibility: 'public', // can be flipped to private by admin
-    created_at: now(),
-    approved_at: null,
+    visibility: 'public',
   });
-  save();
+  if (error) return res.status(500).json({ error: 'db' });
   res.json({ ok: true });
 });
 
-app.get('/api/reviews', (req, res) => {
-  const list = db.reviews
-    .filter(r => r.status === 'approved' && r.visibility === 'public')
-    .map(({ id, name, location, rating, content, created_at }) => ({ id, name, location, rating, content, created_at }));
-  res.json(list);
+app.get('/api/reviews', async (req, res) => {
+  const { data, error } = await sb
+    .from('reviews')
+    .select('id, name, location, rating, content, created_at')
+    .eq('status', 'approved')
+    .eq('visibility', 'public')
+    .order('created_at', { ascending: false });
+  if (error) return res.status(500).json([]);
+  res.json(data || []);
 });
 
-app.post('/api/coupons/validate', (req, res) => {
+app.post('/api/coupons/validate', async (req, res) => {
   const code = String((req.body && req.body.code) || '').trim().toUpperCase();
   if (!code) return res.status(400).json({ error: 'no code' });
-  const coupon = db.coupons.find(c => c.code === code && c.active);
+  const { data: coupon } = await sb.from('coupons')
+    .select('*').eq('code', code).eq('active', true).maybeSingle();
   if (!coupon) return res.status(404).json({ error: 'invalid' });
   if (coupon.expires_at && new Date(coupon.expires_at) < new Date()) return res.status(410).json({ error: 'expired' });
   if (coupon.max_uses && coupon.current_uses >= coupon.max_uses) return res.status(410).json({ error: 'maxed' });
-  res.json({ code: coupon.code, type: coupon.type, value: coupon.value, label: coupon.label || '' });
+  res.json({ code: coupon.code, type: coupon.type, value: Number(coupon.value), label: coupon.label || '' });
+});
+
+app.get('/api/catalog', async (req, res) => {
+  const [over, custom] = await Promise.all([
+    sb.from('product_overrides').select('*'),
+    sb.from('custom_products').select('*'),
+  ]);
+  res.json({
+    overrides: over.data || [],
+    custom: custom.data || [],
+  });
 });
 
 // ---------- Admin auth ----------
-app.post('/api/admin/login', (req, res) => {
+app.post('/api/admin/login', async (req, res) => {
   const { email, password } = req.body || {};
   if (!email || !password) return res.status(400).json({ error: 'missing' });
-  const user = db.admin_users.find(u => u.email === String(email).toLowerCase());
+  const { data: user } = await sb.from('admin_users')
+    .select('id, email, password_hash')
+    .eq('email', String(email).toLowerCase())
+    .maybeSingle();
   if (!user) return res.status(401).json({ error: 'invalid' });
   if (!bcrypt.compareSync(password, user.password_hash)) return res.status(401).json({ error: 'invalid' });
 
-  // Mint a token (cross-origin friendly) AND set the session cookie (same-origin friendly).
   const token = crypto.randomBytes(32).toString('hex');
-  db.admin_sessions.push({ token, user_id: user.id, created_at: now() });
-  if (pruneSessions()) save(); else save();
+  await sb.from('admin_sessions').insert({ token, user_id: user.id });
+  // best-effort prune of expired tokens
+  const cutoff = new Date(Date.now() - TOKEN_TTL_MS).toISOString();
+  await sb.from('admin_sessions').delete().lt('created_at', cutoff);
 
-  req.session.adminId = user.id;
-  req.session.adminEmail = user.email;
-
+  if (req.session) { req.session.adminId = user.id; req.session.adminEmail = user.email; }
   res.json({ ok: true, email: user.email, token });
 });
 
-app.post('/api/admin/logout', (req, res) => {
+app.post('/api/admin/logout', async (req, res) => {
   const token = tokenFromRequest(req);
-  if (token) {
-    db.admin_sessions = db.admin_sessions.filter(s => s.token !== token);
-    save();
-  }
+  if (token) await sb.from('admin_sessions').delete().eq('token', token);
   if (req.session) req.session.destroy(() => res.json({ ok: true }));
   else res.json({ ok: true });
 });
 
-app.get('/api/admin/me', (req, res) => {
-  // Token first (cross-origin)
+app.get('/api/admin/me', async (req, res) => {
   const token = tokenFromRequest(req);
   if (token) {
-    const sess = db.admin_sessions.find(s => s.token === token);
-    if (sess && (Date.now() - new Date(sess.created_at).getTime()) < TOKEN_TTL_MS) {
-      const user = db.admin_users.find(u => u.id === sess.user_id);
-      if (user) return res.json({ email: user.email });
-    }
+    const user = await userFromToken(token);
+    if (user) return res.json({ email: user.email });
   }
-  // Session fallback
   if (req.session && req.session.adminId) return res.json({ email: req.session.adminEmail });
   return res.status(401).json({ error: 'unauthorized' });
 });
 
-// ---------- Admin APIs ----------
-app.get('/api/admin/orders', requireAdmin, (req, res) => {
-  res.json(db.orders);
+// ---------- Admin: orders ----------
+app.get('/api/admin/orders', requireAdmin, async (req, res) => {
+  const { data } = await sb.from('orders').select('*').order('created_at', { ascending: false });
+  res.json(data || []);
 });
 
-app.post('/api/admin/orders/:id/status', requireAdmin, (req, res) => {
-  const order = db.orders.find(o => o.id === req.params.id);
-  if (!order) return res.status(404).json({ error: 'not found' });
+app.post('/api/admin/orders/:id/status', requireAdmin, async (req, res) => {
   const next = String((req.body && req.body.status) || '').toLowerCase();
   if (!['pending', 'paid', 'shipped', 'cancelled'].includes(next)) return res.status(400).json({ error: 'bad status' });
-  order.status = next;
-  order.updated_at = now();
-  save();
-  res.json({ ok: true, order });
+  const { data, error } = await sb.from('orders')
+    .update({ status: next, updated_at: new Date().toISOString() })
+    .eq('id', req.params.id)
+    .select('*').maybeSingle();
+  if (error || !data) return res.status(404).json({ error: 'not found' });
+  res.json({ ok: true, order: data });
 });
 
-app.delete('/api/admin/orders/:id', requireAdmin, (req, res) => {
-  const before = db.orders.length;
-  db.orders = db.orders.filter(o => o.id !== req.params.id);
-  save();
-  res.json({ ok: true, removed: before - db.orders.length });
+app.delete('/api/admin/orders/:id', requireAdmin, async (req, res) => {
+  await sb.from('orders').delete().eq('id', req.params.id);
+  res.json({ ok: true });
 });
 
-app.get('/api/admin/coupons', requireAdmin, (req, res) => res.json(db.coupons));
+// ---------- Admin: coupons ----------
+app.get('/api/admin/coupons', requireAdmin, async (req, res) => {
+  const { data } = await sb.from('coupons').select('*').order('created_at', { ascending: false });
+  res.json(data || []);
+});
 
-app.post('/api/admin/coupons', requireAdmin, (req, res) => {
+app.post('/api/admin/coupons', requireAdmin, async (req, res) => {
   const { code, type, value, expires_at, max_uses, label } = req.body || {};
   if (!code || !type || value == null) return res.status(400).json({ error: 'missing fields' });
   if (!['percent', 'fixed'].includes(type)) return res.status(400).json({ error: 'bad type' });
   const upper = String(code).trim().toUpperCase();
-  if (db.coupons.find(c => c.code === upper)) return res.status(409).json({ error: 'code exists' });
-  const c = {
+  const row = {
     id: uid(),
     code: upper,
     type,
@@ -317,77 +299,142 @@ app.post('/api/admin/coupons', requireAdmin, (req, res) => {
     max_uses: max_uses ? Number(max_uses) : null,
     current_uses: 0,
     active: true,
-    created_at: now(),
   };
-  db.coupons.unshift(c);
-  save();
-  res.json({ ok: true, coupon: c });
+  const { data, error } = await sb.from('coupons').insert(row).select('*').maybeSingle();
+  if (error) {
+    if (String(error.message).toLowerCase().includes('duplicate')) return res.status(409).json({ error: 'code exists' });
+    return res.status(500).json({ error: 'db' });
+  }
+  res.json({ ok: true, coupon: data });
 });
 
-app.delete('/api/admin/coupons/:id', requireAdmin, (req, res) => {
-  db.coupons = db.coupons.filter(c => c.id !== req.params.id);
-  save();
+app.delete('/api/admin/coupons/:id', requireAdmin, async (req, res) => {
+  await sb.from('coupons').delete().eq('id', req.params.id);
   res.json({ ok: true });
 });
 
-app.get('/api/admin/reviews', requireAdmin, (req, res) => res.json(db.reviews));
+// ---------- Admin: reviews ----------
+app.get('/api/admin/reviews', requireAdmin, async (req, res) => {
+  const { data } = await sb.from('reviews').select('*').order('created_at', { ascending: false });
+  res.json(data || []);
+});
 
-app.post('/api/admin/reviews/:id/status', requireAdmin, (req, res) => {
-  const review = db.reviews.find(r => r.id === req.params.id);
-  if (!review) return res.status(404).json({ error: 'not found' });
+app.post('/api/admin/reviews/:id/status', requireAdmin, async (req, res) => {
   const next = String((req.body && req.body.status) || '').toLowerCase();
   if (!['pending', 'approved', 'rejected'].includes(next)) return res.status(400).json({ error: 'bad status' });
-  review.status = next;
-  if (next === 'approved') review.approved_at = now();
-  save();
-  res.json({ ok: true, review });
+  const update = { status: next };
+  if (next === 'approved') update.approved_at = new Date().toISOString();
+  const { data, error } = await sb.from('reviews').update(update).eq('id', req.params.id).select('*').maybeSingle();
+  if (error || !data) return res.status(404).json({ error: 'not found' });
+  res.json({ ok: true, review: data });
 });
 
-app.post('/api/admin/reviews/:id/visibility', requireAdmin, (req, res) => {
-  const review = db.reviews.find(r => r.id === req.params.id);
-  if (!review) return res.status(404).json({ error: 'not found' });
+app.post('/api/admin/reviews/:id/visibility', requireAdmin, async (req, res) => {
   const v = String((req.body && req.body.visibility) || 'public');
-  review.visibility = (v === 'private') ? 'private' : 'public';
-  save();
-  res.json({ ok: true, review });
+  const visibility = (v === 'private') ? 'private' : 'public';
+  const { data, error } = await sb.from('reviews').update({ visibility }).eq('id', req.params.id).select('*').maybeSingle();
+  if (error || !data) return res.status(404).json({ error: 'not found' });
+  res.json({ ok: true, review: data });
 });
 
-app.delete('/api/admin/reviews/:id', requireAdmin, (req, res) => {
-  db.reviews = db.reviews.filter(r => r.id !== req.params.id);
-  save();
+app.delete('/api/admin/reviews/:id', requireAdmin, async (req, res) => {
+  await sb.from('reviews').delete().eq('id', req.params.id);
   res.json({ ok: true });
 });
 
-app.get('/api/admin/products', requireAdmin, (req, res) => res.json(db.product_overrides));
+// ---------- Admin: product overrides ----------
+app.get('/api/admin/products', requireAdmin, async (req, res) => {
+  const { data } = await sb.from('product_overrides').select('*');
+  res.json(data || []);
+});
 
-app.post('/api/admin/products/:id', requireAdmin, (req, res) => {
-  const id = req.params.id;
+app.post('/api/admin/products/:id', requireAdmin, async (req, res) => {
+  const product_id = req.params.id;
   const { name, dose, price, image_url, active } = req.body || {};
-  let entry = db.product_overrides.find(p => p.product_id === id);
-  if (!entry) {
-    entry = { id: uid(), product_id: id, active: true };
-    db.product_overrides.push(entry);
+  // upsert: select existing, then insert or update
+  const { data: existing } = await sb.from('product_overrides').select('id').eq('product_id', product_id).maybeSingle();
+  const fields = { product_id, updated_at: new Date().toISOString() };
+  if (name      != null) fields.name = String(name);
+  if (dose      != null) fields.dose = String(dose);
+  if (price     != null) fields.price = Number(price);
+  if (image_url != null) fields.image_url = String(image_url);
+  if (active    != null) fields.active = !!active;
+  if (existing) {
+    const { data } = await sb.from('product_overrides').update(fields).eq('product_id', product_id).select('*').maybeSingle();
+    return res.json({ ok: true, override: data });
   }
-  if (name      != null) entry.name = String(name);
-  if (dose      != null) entry.dose = String(dose);
-  if (price     != null) entry.price = Number(price);
-  if (image_url != null) entry.image_url = String(image_url);
-  if (active    != null) entry.active = !!active;
-  entry.updated_at = now();
-  save();
-  res.json({ ok: true, override: entry });
+  fields.id = uid();
+  if (fields.active === undefined) fields.active = true;
+  const { data, error } = await sb.from('product_overrides').insert(fields).select('*').maybeSingle();
+  if (error) return res.status(500).json({ error: 'db' });
+  res.json({ ok: true, override: data });
 });
 
-app.delete('/api/admin/products/:id', requireAdmin, (req, res) => {
-  db.product_overrides = db.product_overrides.filter(p => p.product_id !== req.params.id);
-  save();
+app.delete('/api/admin/products/:id', requireAdmin, async (req, res) => {
+  await sb.from('product_overrides').delete().eq('product_id', req.params.id);
   res.json({ ok: true });
 });
 
-app.get('/api/admin/analytics', requireAdmin, (req, res) => {
-  const events = db.analytics;
-  const now30 = Date.now() - 30 * 24 * 60 * 60 * 1000;
-  const recent = events.filter(e => new Date(e.created_at).getTime() >= now30);
+// ---------- Admin: custom products ----------
+app.get('/api/admin/custom-products', requireAdmin, async (req, res) => {
+  const { data } = await sb.from('custom_products').select('*').order('created_at', { ascending: false });
+  res.json(data || []);
+});
+
+app.post('/api/admin/custom-products', requireAdmin, async (req, res) => {
+  const { name, dose, price, category, description, image } = req.body || {};
+  if (!name || price == null) return res.status(400).json({ error: 'missing fields' });
+  const slugBase = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 24) || 'custom';
+  // ensure unique id
+  let id = slugBase, n = 2;
+  while (true) {
+    const { data: clash } = await sb.from('custom_products').select('id').eq('id', id).maybeSingle();
+    if (!clash) break;
+    id = `${slugBase}-${n++}`;
+    if (n > 50) { id = `${slugBase}-${uid()}`; break; }
+  }
+  const product = {
+    id,
+    name: String(name),
+    dose: String(dose || ''),
+    price: Number(price),
+    category: String(category || 'Other'),
+    description: String(description || ''),
+    image: String(image || ''),
+    custom: true,
+  };
+  const { data, error } = await sb.from('custom_products').insert(product).select('*').maybeSingle();
+  if (error) return res.status(500).json({ error: 'db' });
+  res.json({ ok: true, product: data });
+});
+
+app.delete('/api/admin/custom-products/:id', requireAdmin, async (req, res) => {
+  await sb.from('custom_products').delete().eq('id', req.params.id);
+  await sb.from('product_overrides').delete().eq('product_id', req.params.id);
+  res.json({ ok: true });
+});
+
+// ---------- Admin: image picker / upload ----------
+// NOTE: uploads endpoint disabled in cloud mode — Render filesystem is ephemeral.
+// For now the picker only lists images already deployed to the static site.
+// Migrate to Supabase Storage later when needed.
+app.get('/api/admin/images', requireAdmin, (req, res) => {
+  res.json({ disabled: true, message: 'Image picker is local-dev only. Set image_url manually for now.' });
+});
+
+app.post('/api/admin/upload', requireAdmin, (req, res) => {
+  res.status(501).json({ error: 'Image upload not supported in cloud mode. Use SFTP for now.' });
+});
+
+// ---------- Admin: analytics ----------
+app.get('/api/admin/analytics', requireAdmin, async (req, res) => {
+  const since = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+  const [{ data: events }, { data: orders }] = await Promise.all([
+    sb.from('analytics_events').select('event_type, page, product_id, created_at').gte('created_at', since).limit(5000),
+    sb.from('orders').select('total, status, created_at').gte('created_at', since),
+  ]);
+  const recent = events || [];
+  const ord = orders || [];
 
   const by = (key) => recent.reduce((m, e) => {
     const k = e[key]; if (!k) return m;
@@ -398,114 +445,30 @@ app.get('/api/admin/analytics', requireAdmin, (req, res) => {
   const top_products = Object.entries(by('product_id'))
     .sort((a, b) => b[1] - a[1]).slice(0, 12)
     .map(([product_id, count]) => ({ product_id, count }));
-  const pages = Object.entries(by('page'))
+  const top_pages = Object.entries(by('page'))
     .sort((a, b) => b[1] - a[1]).slice(0, 10)
     .map(([page, count]) => ({ page, count }));
 
-  // Order summary
-  const orders30 = db.orders.filter(o => new Date(o.created_at).getTime() >= now30);
-  const order_revenue = orders30.filter(o => o.status === 'paid').reduce((s, o) => s + o.total, 0);
+  const order_revenue = ord.filter(o => o.status === 'paid').reduce((s, o) => s + Number(o.total || 0), 0);
 
   res.json({
     last_30_days: {
       events: recent.length,
-      events_by_type, top_products, top_pages: pages,
-      orders_count: orders30.length,
-      orders_paid: orders30.filter(o => o.status === 'paid').length,
-      orders_pending: orders30.filter(o => o.status === 'pending').length,
+      events_by_type, top_products, top_pages,
+      orders_count: ord.length,
+      orders_paid: ord.filter(o => o.status === 'paid').length,
+      orders_pending: ord.filter(o => o.status === 'pending').length,
       order_revenue,
     },
   });
 });
 
-// ---------- Public catalog (overrides + custom products) ----------
-app.get('/api/catalog', (req, res) => {
-  res.json({
-    overrides: db.product_overrides,
-    custom: db.custom_products,
-  });
-});
-
-// ---------- Admin: list images in /assets/images/ for image picker ----------
-app.get('/api/admin/images', requireAdmin, (req, res) => {
-  const dir = path.join(ROOT, 'assets', 'images');
-  try {
-    const files = fs.readdirSync(dir)
-      .filter(f => /\.(png|jpg|jpeg|webp|gif)$/i.test(f))
-      .sort()
-      .map(f => ({ name: f, url: `assets/images/${f}` }));
-    res.json(files);
-  } catch (e) {
-    res.json([]);
-  }
-});
-
-// ---------- Admin: upload an image (base64 -> /assets/images/uploads/) ----------
-app.post('/api/admin/upload', requireAdmin, (req, res) => {
-  const { filename, data_url } = req.body || {};
-  if (!filename || !data_url) return res.status(400).json({ error: 'missing' });
-  const m = String(data_url).match(/^data:image\/(png|jpe?g|webp|gif);base64,(.+)$/i);
-  if (!m) return res.status(400).json({ error: 'bad data url' });
-  const ext = m[1].toLowerCase().replace('jpeg', 'jpg');
-  const buffer = Buffer.from(m[2], 'base64');
-  if (buffer.length > 10 * 1024 * 1024) return res.status(413).json({ error: 'too large' });
-
-  const safe = String(filename).replace(/[^a-zA-Z0-9._-]/g, '_').slice(0, 80);
-  const stem = safe.replace(/\.[^.]+$/, '');
-  const uploadsDir = path.join(ROOT, 'assets', 'images', 'uploads');
-  if (!fs.existsSync(uploadsDir)) fs.mkdirSync(uploadsDir, { recursive: true });
-  const finalName = `${Date.now()}-${stem}.${ext}`;
-  fs.writeFileSync(path.join(uploadsDir, finalName), buffer);
-  res.json({ ok: true, url: `assets/images/uploads/${finalName}` });
-});
-
-// ---------- Admin: custom products CRUD ----------
-app.post('/api/admin/custom-products', requireAdmin, (req, res) => {
-  const { name, dose, price, category, description, image } = req.body || {};
-  if (!name || price == null) return res.status(400).json({ error: 'missing fields' });
-  const slugBase = String(name).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 24) || 'custom';
-  let id = slugBase, n = 2;
-  while (db.custom_products.find(p => p.id === id)) { id = `${slugBase}-${n++}`; }
-  const product = {
-    id,
-    name: String(name),
-    dose: String(dose || ''),
-    price: Number(price),
-    category: String(category || 'Other'),
-    description: String(description || ''),
-    image: String(image || ''),
-    created_at: now(),
-    custom: true,
-  };
-  db.custom_products.unshift(product);
-  save();
-  res.json({ ok: true, product });
-});
-
-app.delete('/api/admin/custom-products/:id', requireAdmin, (req, res) => {
-  db.custom_products = db.custom_products.filter(p => p.id !== req.params.id);
-  // Also drop any override for this id
-  db.product_overrides = db.product_overrides.filter(o => o.product_id !== req.params.id);
-  save();
-  res.json({ ok: true });
-});
-
-app.get('/api/admin/custom-products', requireAdmin, (req, res) => {
-  res.json(db.custom_products);
-});
-
-// ---------- Admin page server-side gate ----------
-app.get(['/admin', '/admin/'], (req, res) => {
-  if (req.session && req.session.adminId) {
-    return res.sendFile(path.join(ROOT, 'admin', 'index.html'));
-  }
-  return res.sendFile(path.join(ROOT, 'admin', 'login.html'));
-});
-
-// ---------- Static files ----------
-app.use(express.static(ROOT, { extensions: ['html'] }));
+// ---------- Health check ----------
+app.get('/healthz', (req, res) => res.json({ ok: true }));
 
 // ---------- Start ----------
-app.listen(PORT, () => {
-  console.log(`\n  Bane Performance Peptides — running\n  http://localhost:${PORT}\n  http://localhost:${PORT}/admin\n`);
+ensureSeedAdmin().finally(() => {
+  app.listen(PORT, () => {
+    console.log(`Bane API up on :${PORT} (${IS_PROD ? 'production' : 'dev'})`);
+  });
 });
