@@ -31,6 +31,7 @@ let db = {
   orders: [], reviews: [], coupons: [],
   product_overrides: [], custom_products: [],
   analytics: [], admin_users: [],
+  admin_sessions: [], // token-based auth (works cross-origin without 3rd-party cookies)
 };
 
 function load() {
@@ -84,7 +85,7 @@ app.use((req, res, next) => {
     res.setHeader('Vary', 'Origin');
     res.setHeader('Access-Control-Allow-Credentials', 'true');
     res.setHeader('Access-Control-Allow-Methods', 'GET,POST,DELETE,PATCH,OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Accept');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type,Accept,Authorization');
   }
   if (req.method === 'OPTIONS') return res.status(204).end();
   next();
@@ -113,9 +114,44 @@ app.use(session({
   },
 }));
 
-// ---------- Helpers ----------
+// ---------- Token auth helpers ----------
+// Cross-origin browsers (Safari, Firefox strict, Brave, incognito) block 3rd-party
+// cookies by default, which breaks session-based auth when the API is on a
+// different origin from the static site. Tokens in Authorization headers don't
+// have that problem.
+const TOKEN_TTL_MS = 1000 * 60 * 60 * 8; // 8 hours
+
+function pruneSessions() {
+  const cutoff = Date.now() - TOKEN_TTL_MS;
+  const before = db.admin_sessions.length;
+  db.admin_sessions = db.admin_sessions.filter(s => new Date(s.created_at).getTime() > cutoff);
+  return db.admin_sessions.length !== before;
+}
+
+function tokenFromRequest(req) {
+  const h = req.headers.authorization || '';
+  const m = /^Bearer\s+(.+)$/i.exec(h);
+  return m ? m[1].trim() : null;
+}
+
 function requireAdmin(req, res, next) {
-  if (req.session && req.session.adminId) return next();
+  // 1) Token (preferred — works cross-origin)
+  const token = tokenFromRequest(req);
+  if (token) {
+    const sess = db.admin_sessions.find(s => s.token === token);
+    if (sess && (Date.now() - new Date(sess.created_at).getTime()) < TOKEN_TTL_MS) {
+      const user = db.admin_users.find(u => u.id === sess.user_id);
+      if (user) {
+        req.admin = { id: user.id, email: user.email };
+        return next();
+      }
+    }
+  }
+  // 2) Session cookie (still works on localhost / same-origin)
+  if (req.session && req.session.adminId) {
+    req.admin = { id: req.session.adminId, email: req.session.adminEmail };
+    return next();
+  }
   return res.status(401).json({ error: 'unauthorized' });
 }
 
@@ -203,18 +239,41 @@ app.post('/api/admin/login', (req, res) => {
   const user = db.admin_users.find(u => u.email === String(email).toLowerCase());
   if (!user) return res.status(401).json({ error: 'invalid' });
   if (!bcrypt.compareSync(password, user.password_hash)) return res.status(401).json({ error: 'invalid' });
+
+  // Mint a token (cross-origin friendly) AND set the session cookie (same-origin friendly).
+  const token = crypto.randomBytes(32).toString('hex');
+  db.admin_sessions.push({ token, user_id: user.id, created_at: now() });
+  if (pruneSessions()) save(); else save();
+
   req.session.adminId = user.id;
   req.session.adminEmail = user.email;
-  res.json({ ok: true, email: user.email });
+
+  res.json({ ok: true, email: user.email, token });
 });
 
 app.post('/api/admin/logout', (req, res) => {
-  req.session.destroy(() => res.json({ ok: true }));
+  const token = tokenFromRequest(req);
+  if (token) {
+    db.admin_sessions = db.admin_sessions.filter(s => s.token !== token);
+    save();
+  }
+  if (req.session) req.session.destroy(() => res.json({ ok: true }));
+  else res.json({ ok: true });
 });
 
 app.get('/api/admin/me', (req, res) => {
-  if (!req.session.adminId) return res.status(401).json({ error: 'unauthorized' });
-  res.json({ email: req.session.adminEmail });
+  // Token first (cross-origin)
+  const token = tokenFromRequest(req);
+  if (token) {
+    const sess = db.admin_sessions.find(s => s.token === token);
+    if (sess && (Date.now() - new Date(sess.created_at).getTime()) < TOKEN_TTL_MS) {
+      const user = db.admin_users.find(u => u.id === sess.user_id);
+      if (user) return res.json({ email: user.email });
+    }
+  }
+  // Session fallback
+  if (req.session && req.session.adminId) return res.json({ email: req.session.adminEmail });
+  return res.status(401).json({ error: 'unauthorized' });
 });
 
 // ---------- Admin APIs ----------
