@@ -58,7 +58,7 @@ if (IS_PROD) app.set('trust proxy', 1);
 app.use(express.json({ limit: '12mb' }));
 
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS ||
-  'http://localhost:3000,https://cavenaughm20.sg-host.com'
+  'http://localhost:3000,https://cavenaughm20.sg-host.com,https://baneperformance.com,https://www.baneperformance.com'
 ).split(',').map(s => s.trim()).filter(Boolean);
 
 app.use((req, res, next) => {
