@@ -1,0 +1,27 @@
+name: Keep Render service warm
+
+# Render free tier sleeps after 15 minutes of inactivity, causing a
+# 30s–2min cold start when the next visitor hits the API. This pings
+# /healthz every 10 minutes during active hours (12am–11pm UTC = 7pm prev
+# day to 6pm Central Time, covering US daytime) so the service stays
+# warm for real users.
+
+on:
+  schedule:
+    - cron: '*/10 * * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping healthz
+        run: |
+          for i in 1 2 3; do
+            code=$(curl -sS -o /dev/null -w "%{http_code}" --max-time 60 https://bane-api.onrender.com/healthz || echo "fail")
+            echo "Attempt $i: HTTP $code"
+            if [ "$code" = "200" ]; then exit 0; fi
+            sleep 5
+          done
+          echo "All attempts failed"
+          exit 1
