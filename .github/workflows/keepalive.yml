@@ -1,10 +1,31 @@
 name: Keep Render service warm
 
 # Render free tier sleeps after 15 minutes of inactivity, causing a
-# 30s–2min cold start when the next visitor hits the API. This pings
-# /healthz every 10 minutes during active hours (12am–11pm UTC = 7pm prev
-# day to 6pm Central Time, covering US daytime) so the service stays
-# warm for real users.
+# 30s–2min cold start when the next visitor hits the API.
+#
+# BUDGET (this is the constraint that bit us on 2026-08-31):
+# The Render workspace gets 750 free INSTANCE HOURS per calendar month,
+# shared across every free service in it — currently bane-api plus the
+# aaplus-api service (confusingly named "Client-Websites" after its repo).
+# A pinged service never sleeps, so it burns a full hour every hour.
+#
+# The previous cron here was '*/10 * * * *' — every 10 minutes of every
+# hour, 24/7 — despite a comment claiming it only covered 12am-11pm UTC.
+# That kept bane-api awake ~730 hrs/month on its own, 97% of the entire
+# workspace budget, and guaranteed both services got suspended before
+# month end. It did exactly that on 2026-08-31 and again 2026-09-28.
+#
+# Split agreed 2026-10-23 (stay free; AA Plus gets the larger share
+# because its checkout is order-critical):
+#   aaplus-api  7am-7pm Pacific (VPS cron)  ~12.25 h/day -> ~380 h/month
+#   bane-api    14:00-22:59 UTC (this file)  ~9.25 h/day -> ~290 h/month
+#   total ~670 h of 750, ~80 h left for visits outside the windows.
+# 14-22 UTC = 9am-6pm Central in CDT (8am-5pm in CST; cron is UTC).
+# Outside the window the service sleeps and the first visitor takes a
+# cold start, which is the deliberate trade.
+#
+# If a third free service is ever added to this workspace, narrow these
+# windows again or move to a paid instance — 750 hrs does not stretch.
 #
 # GitHub auto-disables scheduled workflows after 60 days without repo
 # activity (this bit us 2026-07-12). The weekly cron below re-enables
@@ -12,7 +33,7 @@ name: Keep Render service warm
 
 on:
   schedule:
-    - cron: '*/10 * * * *'
+    - cron: '*/10 14-22 * * *'
     - cron: '0 12 * * 1'
   workflow_dispatch:
 
